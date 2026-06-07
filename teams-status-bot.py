@@ -32,13 +32,13 @@ if not email or not password:
     raise SystemExit("Missing TEAMS_EMAIL / TEAMS_PASSWORD. Copy .env.example to .env and fill them in.")
 
 # Status to set: /busy | /available | /away | /berightback | /donotdisturb
-status = "/busy"
+status = os.environ.get("TEAMS_STATUS", "/busy")
 
 # The frequency that you want to update your status in minutes
-updateEvery = 5  # => in minutes
+updateEvery = int(os.environ.get("UPDATE_EVERY_MIN", "5"))
 
 # For how long you want to keep this running
-forHours = 8  # => in hours
+forHours = float(os.environ.get("FOR_HOURS", "8"))
 
 # Run Chrome in the background (no visible window)
 # headless = False
