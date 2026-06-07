@@ -165,25 +165,27 @@ def runAutomation(email, password, status, every, hours):
     log("=" * 50)
     log("[run] Starting new run")
     setupDriver()
-    time.sleep(5)  # let any login redirect settle
+    try:
+        time.sleep(5)  # let any login redirect settle
 
-    if not isLoggedIn():
-        if headless:
-            driver.save_screenshot("login_state.png")
-            log("[login] Not signed in and headless=True — can't do OTP in the "
-                "background. Set headless=False at the top, run once to "
-                "sign in by hand, then switch back to headless=True.")
-            driver.quit()
-            return
-        tryAutoLogin(email, password)
-        if not waitUntilLoggedIn(300):
-            log("[login] Timed out waiting for sign-in. Exiting.")
-            driver.quit()
-            return
+        if not isLoggedIn():
+            if headless:
+                driver.save_screenshot("login_state.png")
+                log("[login] Not signed in and headless=True — can't do OTP in the "
+                    "background. Set headless=False at the top, run once to "
+                    "sign in by hand, then switch back to headless=True.")
+                return
+            tryAutoLogin(email, password)
+            if not waitUntilLoggedIn(300):
+                log("[login] Timed out waiting for sign-in. Exiting.")
+                return
 
-    keepUpdating(status=status, every=every, hours=hours)
-    driver.quit()
-    log("[done] Browser closed.")
+        keepUpdating(status=status, every=every, hours=hours)
+    except KeyboardInterrupt:
+        log("[stopped] Interrupted by user (Ctrl+C).")
+    finally:
+        driver.quit()
+        log("[done] Browser closed.")
 
 
 # MAIN RUNNING POINT OF THIS APP
