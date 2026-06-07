@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# teams-status-bot runtime artifacts
+chrome-profile/
+login_state.png

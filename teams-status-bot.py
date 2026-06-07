@@ -1,9 +1,11 @@
 #!/usr/bin/python3
 
 from selenium import webdriver
+from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver import ActionChains
+from selenium.webdriver.chrome.options import Options
 from datetime import datetime
+import os
 import time
 
 
@@ -12,160 +14,183 @@ import time
 # ======================================================================================== #
 
 
-# you can get yours updated driver from here: https://sites.google.com/a/chromium.org/chromedriver/downloads
-driver = webdriver.Chrome("./chromedriver")
+# Credentials are read from a local .env file (see .env.example). Never commit .env.
+def loadEnv(path=".env"):
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    os.environ.setdefault(key.strip(), value.strip())
 
-# Email
-email = "REPLACE_THIS_WITH_YOUR_TEAMS_EMAIL_ADDRESS"
 
-# Password
-password = "REPLACE_THIS_WITH_YOUR_PASSWORD"
+loadEnv()
+email = os.environ.get("TEAMS_EMAIL")
+password = os.environ.get("TEAMS_PASSWORD")
+if not email or not password:
+    raise SystemExit("Missing TEAMS_EMAIL / TEAMS_PASSWORD. Copy .env.example to .env and fill them in.")
+
+# Status to set: /busy | /available | /away | /berightback | /donotdisturb
+status = "/busy"
 
 # The frequency that you want to update your status in minutes
-updateEvery = 1  # => in minutes, means it will update your status ever one minute
+updateEvery = 5  # => in minutes
 
-# For how long you want to keep this running, default = 1 hour
-forHours = 8  # => in hours, means it will keep the program running for 8 hours
+# For how long you want to keep this running
+forHours = 8  # => in hours
+
+# Run Chrome in the background (no visible window)
+# headless = False
+headless = True
+
+# File where run logs are saved (so you can review previous runs)
+LOG_FILE = "bot.log"
 
 
 # ======================================================================================== #
 # ======================================== LOGIC ========================================= #
 # ======================================================================================== #
 
+driver = None
+
+
+def log(message):
+    # Print to the terminal and append to LOG_FILE so previous runs can be reviewed.
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}"
+    print(line)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+
 
 def setupDriver():
-    # opens MS teams web page
+    global driver
+    options = Options()
+    if headless:
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
+    options.add_argument("--user-data-dir=./chrome-profile")
+    driver = webdriver.Chrome(options=options)
     driver.get("https://teams.microsoft.com/")
-
-    # Sets a sticky timeout to implicitly wait for an element to be found,
-    # or a command to complete.
-    # This method only needs to be called one time per session.
     driver.implicitly_wait(45)
     driver.set_page_load_timeout(30)
+    log("[setup] Chrome launched" + (" (headless)" if headless else "") + ", loading Teams...")
 
 
-def findElement(xPath, _driver=driver):
-    """
-        Finds an element by it's xPath.
-
-        :Args:
-         - xPath: HTML xPath.
-         - _driver: WebDriver
-
-        :Usage:
-
-            findElement(xPath="html/...")
-
-    """
-    return _driver.find_element_by_xpath(xPath)
+# Maps the status you set at the top to the menu item in Teams.
+STATUS_TIDS = {
+    "/available": "me_control_presence_availability_available",
+    "/busy": "me_control_presence_availability_busy",
+    "/donotdisturb": "me_control_presence_availability_do_not_disturb",
+    "/berightback": "me_control_presence_availability_be_right_back",
+    "/away": "me_control_presence_availability_appear_away",
+    "/offline": "me_control_presence_availability_appear_offline",
+}
 
 
-def login(email, password):
-    # getting email text box
-    emailBox = findElement("/html/body/div/form[1]/div/div/div[2]/div[1]/div/div/div/div/div[1]/div[3]/div/div/div/div[2]/div[2]/div/input[1]")
-
-    # adding email address in the text box
-    emailBox.send_keys(email)
-
-    # clicking enter to continue
-    emailBox.send_keys(Keys.RETURN)
-
-    # getting the password text box element
-    passwordBox = findElement("/html/body/div[2]/div[2]/div[1]/div[2]/div/div/form/div[2]/div[2]/input")
-
-    # adding the password
-    passwordBox.send_keys(password)
-
-    # clicking enter to continue
-    passwordBox.send_keys(Keys.RETURN)
-
-    useOTP = findElement("/html/body/div/form[1]/div/div/div[2]/div[1]/div/div/div/div/div/div/div[1]/div/div[2]/div[2]/div/div[2]/div/div[2]/div/div[1]/div/div/div[2]/div")
-
-    useOTP.click()
+def click(css):
+    driver.find_element(By.CSS_SELECTOR, css).click()
 
 
-def stayLoggedIn(value: bool = False):
-    if value:
-        saveSession = findElement("/html/body/div/form/div[1]/div/div[1]/div[2]/div/div[2]/div/div[3]/div[2]/div/div/div[2]/input")
-        saveSession.send_keys(Keys.RETURN)
-    else:
-        # don't stay logged in
-        saveSession = findElement("/html/body/div/form/div/div/div[2]/div[1]/div/div/div/div/div/div/div[1]/div[2]/div/div[2]/div/div[3]/div[2]/div/div/div[1]/input")
-        saveSession.send_keys(Keys.RETURN)
+def isLoggedIn():
+    # When signed in, we land on the Teams app. When not, we get redirected
+    # to login.microsoftonline.com or the company's own login server.
+    url = driver.current_url
+    return "teams.microsoft.com" in url and "login" not in url
 
 
-def useTeamsOnTheWeb():
-    # use MS teams on the web
-    # useOnWeb = findElement("/html/body/promote-desktop/div/div/div/div[1]/div[2]/div/a")
-    # useOnWeb.click()
-    # print("useOnWeb has been clicked 😎 ..")
-    time.sleep(5)
+def tryAutoLogin(email, password):
+    # Best-effort: fill email + password on Microsoft's standard login page.
+    # If the org redirects to its own login server or asks for an OTP, this
+    # stops early and you finish signing in by hand in the window.
+    try:
+        log("[login] Filling email...")
+        box = driver.find_element(By.NAME, "loginfmt")
+        box.send_keys(email)
+        box.send_keys(Keys.RETURN)
+        time.sleep(3)
+
+        log("[login] Filling password...")
+        box = driver.find_element(By.NAME, "passwd")
+        box.send_keys(password)
+        box.send_keys(Keys.RETURN)
+    except Exception as e:
+        log(f"[login] Auto-fill stopped ({type(e).__name__}). Finish signing in manually in the browser window.")
+
+
+def waitUntilLoggedIn(timeout_seconds=300):
+    log("[login] Waiting for you to finish signing in (OTP/MFA)... up to "
+        f"{timeout_seconds // 60} min.")
+    driver.implicitly_wait(0)  # don't let find/url checks block; poll instead
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if isLoggedIn():
+            driver.implicitly_wait(45)
+            log("[login] Signed in. Session saved to ./chrome-profile.")
+            return True
+        time.sleep(3)
+    driver.implicitly_wait(45)
+    return False
 
 
 def updateStatus(status: str = "/busy"):
-    """
-        Set your profile status to whatever you pass.
+    tid = STATUS_TIDS.get(status)
+    if tid is None:
+        log(f"[status] Unknown status '{status}'. Valid: {', '.join(STATUS_TIDS)}")
+        return
 
-        :Args:
-         - status: "/available".
-
-        :Usage:
-
-            updateStatus(status="/available")
-
-    """
-    # select the search bar
-    searchBox = findElement("/html/body/div[2]/div[1]/app-header-bar/div/power-bar/div/div/form/search-box/div/input")
-    searchBox.send_keys(status)
-    # select `available` from the dropdown menu
-    select = findElement("/html/body/div[2]/div[1]/app-header-bar/div/power-bar/div/div/form/slash-command-box/div/slash-command-popover/div/div[2]/ul/li/div")
-    select.click()
-
-    # datetime object containing current date and time
-    now = datetime.now()
-    # dd/mm/YY H:M:S
-    dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
-    print("updateStatus, 😎 .. date and time =", dt_string)
-
-# busy
-# available
+    # Open the profile menu, open the status submenu, then pick the status.
+    click("[data-tid='me-control-avatar-trigger']")
+    time.sleep(1)
+    click("[data-tid='set-presence-status-menu-item']")
+    time.sleep(1)
+    click(f"[data-tid='{tid}']")
+    log(f"[status] Set to '{status}'")
 
 
 def keepUpdating(status: str = "/busy", every: int = 5, hours: int = 1):
-    """
-        Automate updating your status with time logic.
-
-        :Args:
-         - status: "/available".
-         - every: the frequency that you want to update your status
-         - hours: for how long you want to keep this running, default = 1 hour 
-
-        :Usage:
-
-            # The below usage example will keep updating the status every 5 minuts 
-            # for maxmum 8 hours then it will stop.
-            keepUpdating(status="/available", every=5, hours=8)
-    """
-    selectedRange: int = int((hours * 60) / every)
-    for _ in range(selectedRange):
+    total_updates = int((hours * 60) / every)
+    log(f"[loop] Will update status '{status}' every {every} min for {hours} h ({total_updates} times)")
+    for i in range(total_updates):
         updateStatus(status)
-        time.sleep(every * 60)
+        if i < total_updates - 1:
+            log(f"[loop] {i+1}/{total_updates} done — next update in {every} min")
+            time.sleep(every * 60)
+    log("[loop] Done.")
 
 
-def runAutomation(email, password, every, hours):
+def runAutomation(email, password, status, every, hours):
+    log("=" * 50)
+    log("[run] Starting new run")
     setupDriver()
-    login(email, password)
-    stayLoggedIn(False)
-    useTeamsOnTheWeb()
-    keepUpdating(every=every, hours=hours)
-    # then quit the browser once done
+    time.sleep(5)  # let any login redirect settle
+
+    if not isLoggedIn():
+        if headless:
+            driver.save_screenshot("login_state.png")
+            log("[login] Not signed in and headless=True — can't do OTP in the "
+                "background. Set headless=False at the top, run once to "
+                "sign in by hand, then switch back to headless=True.")
+            driver.quit()
+            return
+        tryAutoLogin(email, password)
+        if not waitUntilLoggedIn(300):
+            log("[login] Timed out waiting for sign-in. Exiting.")
+            driver.quit()
+            return
+
+    keepUpdating(status=status, every=every, hours=hours)
     driver.quit()
+    log("[done] Browser closed.")
 
 
 # MAIN RUNNING POINT OF THIS APP
 runAutomation(
     email=email,
     password=password,
+    status=status,
     every=updateEvery,
     hours=forHours
 )
