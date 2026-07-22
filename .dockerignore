@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+chrome-profile/
+chromedriver
+*.png
+*.log
+.git/

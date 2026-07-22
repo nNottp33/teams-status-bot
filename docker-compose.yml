@@ -1,0 +1,8 @@
+services:
+  teams-status-bot:
+    build: .
+    env_file: .env
+    volumes:
+      - ./chrome-profile:/app/chrome-profile   # keeps the Teams login session
+    restart: unless-stopped
+    shm_size: 1g

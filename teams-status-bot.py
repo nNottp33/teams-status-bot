@@ -126,7 +126,14 @@ def setupDriver():
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
     options.add_argument(f"--user-data-dir={PROFILE_DIR}")
-    driver = webdriver.Chrome(options=options)
+    # In Docker, Selenium Manager has no linux/arm64 build, so the image sets
+    # CHROMEDRIVER_PATH to the system chromedriver. Unset = old behavior.
+    driver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if driver_path:
+        from selenium.webdriver.chrome.service import Service
+        driver = webdriver.Chrome(service=Service(driver_path), options=options)
+    else:
+        driver = webdriver.Chrome(options=options)
     driver.get("https://teams.microsoft.com/")
     driver.implicitly_wait(45)
     driver.set_page_load_timeout(30)
@@ -227,27 +234,64 @@ def waitUntilLoggedIn(timeout_seconds=300):
     return False
 
 
+def dumpFailureState(tag):
+    # When a status update times out, the chromedriver stack tells us nothing
+    # about what the page actually looked like. Capture the URL + a screenshot
+    # so the NEXT failure is a decisive breadcrumb (open flyout = slow render;
+    # no menu = avatar toggle problem; login page = session/throttle).
+    try:
+        log(f"[status] Failure state — url={driver.current_url}")
+    except Exception:
+        pass
+    try:
+        shot = f"fail_{tag}_{datetime.now():%H%M%S}.png"
+        driver.save_screenshot(shot)
+        log(f"[status] Saved {shot}")
+    except Exception:
+        pass
+
+
+def openStatusMenu(status, tid):
+    # Open the profile menu, open the status submenu, then pick the status.
+    # The submenu step gets a longer wait: on a headless tab that's been idle
+    # for minutes the renderer is throttled and the flyout can paint slowly.
+    log("[status] Opening profile menu...")
+    waitAndClick("[data-tid='me-control-avatar-trigger']")
+    log("[status] Opening status submenu...")
+    waitAndClick("[data-tid='set-presence-status-menu-item']", timeout=30)
+    log(f"[status] Selecting '{status}'...")
+    waitAndClick(f"[data-tid='{tid}']")
+    log(f"[status] Set to '{status}'")
+
+
 def updateStatus(status: str = "/busy"):
     tid = STATUS_TIDS.get(status)
     if tid is None:
         log(f"[status] Unknown status '{status}'. Valid: {', '.join(STATUS_TIDS)}")
         return
 
-    # Dismiss any open menus so the avatar trigger always opens (not closes) the flyout.
-    try:
-        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-    # Open the profile menu, open the status submenu, then pick the status.
-    log("[status] Opening profile menu...")
-    waitAndClick("[data-tid='me-control-avatar-trigger']")
-    log("[status] Opening status submenu...")
-    waitAndClick("[data-tid='set-presence-status-menu-item']")
-    log(f"[status] Selecting '{status}'...")
-    waitAndClick(f"[data-tid='{tid}']")
-    log(f"[status] Set to '{status}'")
+    # The flyout open/click sequence flakes intermittently (a throttled idle
+    # renderer, or a stray menu left open so the avatar click toggles it shut).
+    # Retry the whole sequence within the cycle instead of losing 5 minutes.
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        # Dismiss any open menus so the avatar trigger always opens (not closes)
+        # the flyout.
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            time.sleep(0.5)
+        except Exception:
+            pass
+        try:
+            openStatusMenu(status, tid)
+            return
+        except Exception as e:
+            log(f"[status] Attempt {attempt}/{attempts} failed "
+                f"({type(e).__name__}).")
+            dumpFailureState(f"attempt{attempt}")
+            if attempt == attempts:
+                raise
+            time.sleep(2)
 
 
 def keepUpdating(status: str = "/busy", every: int = 5, hours: int = 1):
