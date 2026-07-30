@@ -8,6 +8,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -34,7 +35,12 @@ def loadEnv(path=".env"):
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, _, value = line.partition("=")
-                    os.environ.setdefault(key.strip(), value.strip())
+                    value = value.strip()
+                    # Strip matching surrounding quotes like dotenv/compose do,
+                    # else they get typed into the password field verbatim.
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                        value = value[1:-1]
+                    os.environ.setdefault(key.strip(), value)
 
 
 loadEnv()
@@ -52,9 +58,10 @@ updateEvery = int(os.environ.get("UPDATE_EVERY_MIN", "5"))
 # For how long you want to keep this running
 forHours = float(os.environ.get("FOR_HOURS", "8"))
 
-# Run Chrome in the background (no visible window)
-# headless = False
-headless = True
+# Run Chrome in the background (no visible window).
+# HEADLESS=0 shows the window — needed for the interactive MFA/OTP sign-in
+# that refreshes ./chrome-profile. No file edit required for that run.
+headless = os.environ.get("HEADLESS", "1") != "0"
 
 # File where run logs are saved (so you can review previous runs)
 LOG_FILE = "bot.log"
@@ -169,8 +176,27 @@ def waitAndClick(css, timeout=15):
 def isLoggedIn():
     # When signed in, we land on the Teams app. When not, we get redirected
     # to login.microsoftonline.com or the company's own login server.
-    url = driver.current_url
+    url = driver.current_url or ""  # None while the page is mid-navigation
     return "teams.microsoft.com" in url and "login" not in url
+
+
+class SessionExpired(Exception):
+    pass
+
+
+def currentPresence():
+    # Authoritative readout of what the SERVER thinks: Teams writes it into the
+    # avatar trigger's aria-label, e.g. "Your profile, status Available".
+    driver.implicitly_wait(0)
+    try:
+        el = driver.find_elements(
+            By.CSS_SELECTOR, "[data-tid='me-control-avatar-trigger']"
+        )
+        return (el[0].get_attribute("aria-label") or "") if el else ""
+    except Exception:
+        return ""
+    finally:
+        driver.implicitly_wait(45)
 
 
 def waitForAppShell(timeout=180):
@@ -261,7 +287,24 @@ def openStatusMenu(status, tid):
     waitAndClick("[data-tid='set-presence-status-menu-item']", timeout=30)
     log(f"[status] Selecting '{status}'...")
     waitAndClick(f"[data-tid='{tid}']")
-    log(f"[status] Set to '{status}'")
+    # "the click didn't raise" is NOT success: the presence write is server
+    # side and gets dropped silently when the saved session is stale. Teams
+    # then boots from cache (shell renders, chats look normal) but reports
+    # presence "Unknown" — which is how this bot logged "Set to '/available'"
+    # every 5 min for weeks while nobody saw the status change. Only trust the
+    # readout, and only treat "Unknown" as fatal: the wording of the other
+    # states is not verified, so matching them could fail a working run.
+    time.sleep(2)  # let the badge repaint after the write
+    presence = currentPresence()
+    if "Unknown" in presence:
+        raise SessionExpired(
+            f"clicked '{status}' but presence still reads {presence!r} — the "
+            "saved session in ./chrome-profile is stale, so Teams drops every "
+            "presence write. Fix: docker compose down, set headless=False, run "
+            "`python teams-status-bot.py` once and sign in by hand (MFA/OTP), "
+            "set headless=True, then docker compose up -d --build."
+        )
+    log(f"[status] Set to '{status}' — avatar now reads {presence!r}")
 
 
 def updateStatus(status: str = "/busy"):
@@ -275,6 +318,16 @@ def updateStatus(status: str = "/busy"):
     # Retry the whole sequence within the cycle instead of losing 5 minutes.
     attempts = 2
     for attempt in range(1, attempts + 1):
+        # Teams' MSAL sometimes redirects the whole tab to login.microsoftonline.com
+        # to fetch a token for a sub-app (Viva Engage) with
+        # redirect_uri=brk-multihub://, a native-broker scheme plain Chrome can't
+        # follow. The flow then never completes and the tab is stranded on the auth
+        # page for good — same client-request-id for every later cycle — so clicking
+        # the avatar can only ever time out. Navigate back to Teams to recover.
+        if not isLoggedIn():
+            log("[status] Tab left Teams (auth redirect) — reloading Teams...")
+            driver.get("https://teams.microsoft.com/")
+            waitForAppShell()
         # Dismiss any open menus so the avatar trigger always opens (not closes)
         # the flyout.
         try:
@@ -285,6 +338,8 @@ def updateStatus(status: str = "/busy"):
         try:
             openStatusMenu(status, tid)
             return
+        except SessionExpired:
+            raise  # retrying can't refresh a stale session
         except Exception as e:
             log(f"[status] Attempt {attempt}/{attempts} failed "
                 f"({type(e).__name__}).")
@@ -300,6 +355,10 @@ def keepUpdating(status: str = "/busy", every: int = 5, hours: int = 1):
     for i in range(total_updates):
         try:
             updateStatus(status)
+        except SessionExpired:
+            # Retrying can't help: only an interactive sign-in refreshes the
+            # profile. Stop the run so the reason is the last thing in the log.
+            raise
         except Exception as e:
             # A single transient failure (e.g. a slow renderer) shouldn't tear
             # down the whole multi-hour run — log it and try again next cycle.
@@ -334,9 +393,37 @@ def runAutomation(email, password, status, every, hours):
         # URL says we're "logged in" the moment Teams starts loading, but the
         # app shell (and the avatar we click) isn't rendered yet. Wait for it.
         waitForAppShell()
-        keepUpdating(status=status, every=every, hours=hours)
+        try:
+            keepUpdating(status=status, every=every, hours=hours)
+        except SessionExpired:
+            # A stale session still boots Teams from the service-worker cache:
+            # the URL stays teams.microsoft.com, so isLoggedIn() passes and the
+            # login flow never runs — even after hitting the AAD logout URL
+            # (verified: the shell was back in 10s with no login redirect).
+            # The only reliable reset is a fresh profile. Non-headless is the
+            # interactive repair run: park the old profile, sign in clean.
+            if headless:
+                raise
+            log("[login] Stale session — parking the old profile and signing in fresh...")
+            driver.quit()
+            stale = PROFILE_DIR + ".stale"
+            if os.path.exists(stale):
+                shutil.rmtree(stale)
+            os.rename(PROFILE_DIR, stale)
+            setupDriver()
+            time.sleep(5)
+            if not isLoggedIn():
+                tryAutoLogin(email, password)
+                if not waitUntilLoggedIn(300):
+                    log("[login] Timed out waiting for sign-in. Exiting.")
+                    return
+            waitForAppShell()
+            keepUpdating(status=status, every=every, hours=hours)
     except KeyboardInterrupt:
         log("[stopped] Interrupted by user (Ctrl+C).")
+    except SessionExpired as e:
+        log(f"[error] SessionExpired: {e}")
+        raise  # __main__ turns this into exit 2 so the scheduler backs off
     except Exception as e:
         log(f"[error] {type(e).__name__}: {e}")
         try:
@@ -351,10 +438,14 @@ def runAutomation(email, password, status, every, hours):
 
 
 # MAIN RUNNING POINT OF THIS APP
-runAutomation(
-    email=email,
-    password=password,
-    status=status,
-    every=updateEvery,
-    hours=forHours
-)
+if __name__ == "__main__":
+    try:
+        runAutomation(
+            email=email,
+            password=password,
+            status=status,
+            every=updateEvery,
+            hours=forHours
+        )
+    except SessionExpired:
+        raise SystemExit(2)  # entrypoint.sh backs off instead of relaunching

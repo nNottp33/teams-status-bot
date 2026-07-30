@@ -1,6 +1,10 @@
 services:
   teams-status-bot:
     build: .
+    # Fixed hostname: Chrome's profile SingletonLock stores <hostname>-<pid>.
+    # A new container = new hostname, and Chrome refuses a lock from
+    # "another computer". Same hostname -> dead PID -> Chrome recovers itself.
+    hostname: teams-status-bot
     env_file: .env
     volumes:
       - ./chrome-profile:/app/chrome-profile   # keeps the Teams login session

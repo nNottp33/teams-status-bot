@@ -16,7 +16,15 @@ while true; do
         FOR_HOURS=$(awk "BEGIN{printf \"%.2f\", 18 - $h - $m / 60}")
         export FOR_HOURS
         echo "[scheduler] In work window, starting bot for ${FOR_HOURS}h"
-        python teams-status-bot.py
+        python teams-status-bot.py || rc=$?
+        # exit 2 = the saved session needs a manual sign-in. Relaunching every
+        # 60s would just burn a Chrome start per minute for the whole window,
+        # so back off — but keep retrying, so it self-heals once you sign in.
+        if [ "${rc:-0}" -eq 2 ]; then
+            echo "[scheduler] Session needs a manual sign-in — retrying in 15 min"
+            sleep 900
+        fi
+        rc=0
         echo "[scheduler] Bot exited, waiting for next window"
         waiting_logged=0
     elif [ "$waiting_logged" -eq 0 ]; then
