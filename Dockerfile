@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir selenium
 
 WORKDIR /app
 COPY teams-status-bot.py entrypoint.sh ./
-RUN chmod +x entrypoint.sh
+# strip CRLF so the image works no matter what OS it was built on
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 CMD ["./entrypoint.sh"]
