@@ -129,9 +129,13 @@ def setupDriver():
     options = Options()
     if headless:
         options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
+    # Chrome runs as root in the container and refuses to start without
+    # --no-sandbox even non-headless (the WSLg sign-in run). CHROMEDRIVER_PATH
+    # doubles as the "running in Docker" signal.
+    if headless or os.environ.get("CHROMEDRIVER_PATH"):
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1920,1080")
     options.add_argument(f"--user-data-dir={PROFILE_DIR}")
     # In Docker, Selenium Manager has no linux/arm64 build, so the image sets
     # CHROMEDRIVER_PATH to the system chromedriver. Unset = old behavior.
@@ -326,8 +330,29 @@ def updateStatus(status: str = "/busy"):
         # the avatar can only ever time out. Navigate back to Teams to recover.
         if not isLoggedIn():
             log("[status] Tab left Teams (auth redirect) — reloading Teams...")
-            driver.get("https://teams.microsoft.com/")
-            waitForAppShell()
+            try:
+                driver.get("https://teams.microsoft.com/")
+            except Exception as e:
+                # get() itself can throw "Timed out receiving message from
+                # renderer" while the page keeps loading in the background.
+                # Letting it escape here skips the dead-session check below
+                # (seen: every cycle died at ~27s and just "retried next
+                # cycle" forever). The shell wait is the real signal.
+                log(f"[status] Reload navigation timed out ({type(e).__name__})"
+                    " — checking the app shell anyway...")
+            # A stranded broker redirect recovers here. A dead session doesn't:
+            # AAD bounces the reload straight back to an interactive sign-in
+            # page (blank email field — seen in fail_*.png), so the shell never
+            # appears and no reload can ever fix it. Stop instead of burning
+            # the whole window timing out every cycle.
+            if not waitForAppShell() and not isLoggedIn():
+                raise SessionExpired(
+                    "reloading Teams bounced straight back to the Microsoft "
+                    "sign-in page — the saved session in ./chrome-profile is "
+                    "expired and needs an interactive sign-in. Fix: docker "
+                    "compose down, run once with HEADLESS=0 and sign in by "
+                    "hand (MFA/OTP), then docker compose up -d."
+                )
         # Dismiss any open menus so the avatar trigger always opens (not closes)
         # the flyout.
         try:
@@ -384,7 +409,10 @@ def runAutomation(email, password, status, every, hours):
                 log("[login] Not signed in and headless=True — can't do OTP in the "
                     "background. Set headless=False at the top, run once to "
                     "sign in by hand, then switch back to headless=True.")
-                return
+                # Exit 2 so the scheduler backs off 15 min instead of
+                # relaunching a fresh Chrome every 60 s all window long.
+                raise SessionExpired("not signed in and headless — needs an "
+                                     "interactive sign-in")
             tryAutoLogin(email, password)
             if not waitUntilLoggedIn(300):
                 log("[login] Timed out waiting for sign-in. Exiting.")
@@ -409,7 +437,17 @@ def runAutomation(email, password, status, every, hours):
             stale = PROFILE_DIR + ".stale"
             if os.path.exists(stale):
                 shutil.rmtree(stale)
-            os.rename(PROFILE_DIR, stale)
+            try:
+                os.rename(PROFILE_DIR, stale)
+            except OSError:
+                # In Docker the profile dir is a bind mount — the mount point
+                # itself can't be renamed. Wiping its contents is the same reset.
+                for name in os.listdir(PROFILE_DIR):
+                    p = os.path.join(PROFILE_DIR, name)
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        shutil.rmtree(p)
+                    else:
+                        os.remove(p)
             setupDriver()
             time.sleep(5)
             if not isLoggedIn():
@@ -439,6 +477,9 @@ def runAutomation(email, password, status, every, hours):
 
 # MAIN RUNNING POINT OF THIS APP
 if __name__ == "__main__":
+    # docker stop sends SIGTERM: treat it like Ctrl+C so driver.quit() runs
+    # and a freshly saved session gets flushed to ./chrome-profile.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         runAutomation(
             email=email,

@@ -48,4 +48,40 @@ def run(url):
 stranded = "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize?x=1"
 assert run(stranded) == ["https://teams.microsoft.com/"], "stranded tab was not reloaded"
 assert run("https://teams.microsoft.com/v2/") == [], "healthy tab should not reload"
-print("ok: recovers from the auth-page redirect, leaves a healthy tab alone")
+
+
+class BounceDriver(FakeDriver):
+    def get(self, url):
+        self.visited.append(url)
+        self.current_url = stranded  # AAD sends the tab right back to login
+
+
+bot.driver = BounceDriver(stranded)
+bot.log = lambda *_: None
+bot.waitForAppShell = lambda *a, **k: False  # skip the real 180s poll
+try:
+    bot.updateStatus("/busy")
+except bot.SessionExpired:
+    pass
+else:
+    raise AssertionError("dead session was not detected as SessionExpired")
+
+
+# get() itself can raise ("Timed out receiving message from renderer"); that
+# must not skip the dead-session check.
+class RenderTimeoutDriver(FakeDriver):
+    def get(self, url):
+        raise Exception("timeout: Timed out receiving message from renderer")
+
+
+bot.driver = RenderTimeoutDriver(stranded)
+try:
+    bot.updateStatus("/busy")
+except bot.SessionExpired:
+    pass
+else:
+    raise AssertionError("get() timeout bypassed the dead-session check")
+
+print("ok: recovers from the auth-page redirect, leaves a healthy tab alone, "
+      "raises SessionExpired when the reload bounces back to sign-in "
+      "(even when the reload navigation itself times out)")
