@@ -235,11 +235,36 @@ def tryAutoLogin(email, password):
     # If the org redirects to its own login server or asks for an OTP, this
     # stops early and you finish signing in by hand in the window.
     try:
-        log("[login] Filling email...")
-        box = driver.find_element(By.NAME, "loginfmt")
-        box.send_keys(email)
-        box.send_keys(Keys.RETURN)
-        time.sleep(3)
+        # A previous attempt leaves Microsoft's "Pick an account" page, which
+        # has no loginfmt field — click the saved account tile instead. Poll
+        # briefly: the redirect to the login page may still be in flight.
+        driver.implicitly_wait(0)
+        tiles = []
+        for _ in range(10):
+            tiles = [t for t in driver.find_elements(
+                By.XPATH, f"//*[contains(text(), '{email}')]") if t.is_displayed()]
+            if tiles or driver.find_elements(By.NAME, "loginfmt"):
+                break
+            time.sleep(2)
+        driver.implicitly_wait(45)
+        if tiles:
+            log("[login] Picking saved account tile...")
+            tile = tiles[0]
+            try:
+                # The email text sits in a plain div — the clickable thing is
+                # the tile button wrapping it.
+                tile = tile.find_element(
+                    By.XPATH, "ancestor-or-self::*[@role='button' or self::button][1]")
+            except Exception:
+                pass
+            driver.execute_script("arguments[0].click()", tile)
+            time.sleep(3)
+        else:
+            log("[login] Filling email...")
+            box = driver.find_element(By.NAME, "loginfmt")
+            box.send_keys(email)
+            box.send_keys(Keys.RETURN)
+            time.sleep(3)
 
         log("[login] Filling password...")
         box = driver.find_element(By.NAME, "passwd")
@@ -247,6 +272,11 @@ def tryAutoLogin(email, password):
         box.send_keys(Keys.RETURN)
     except Exception as e:
         log(f"[login] Auto-fill stopped ({type(e).__name__}). Finish signing in manually in the browser window.")
+        try:
+            driver.save_screenshot("login_state.png")
+            log("[login] Saved login_state.png (what the login page looks like)")
+        except Exception:
+            pass
 
 
 def waitUntilLoggedIn(timeout_seconds=300):
@@ -259,6 +289,19 @@ def waitUntilLoggedIn(timeout_seconds=300):
             driver.implicitly_wait(45)
             log("[login] Signed in. Session saved to ./chrome-profile.")
             return True
+        # Auto-accept the "Stay signed in?" page so approving MFA on the
+        # phone is the only manual step left.
+        try:
+            btns = driver.find_elements(By.ID, "idSIButton9")
+            if btns and btns[0].is_displayed():
+                log("[login] Clicking 'Stay signed in?' Yes...")
+                btns[0].click()
+        except Exception:
+            pass
+        try:
+            driver.save_screenshot("login_state.png")
+        except Exception:
+            pass
         time.sleep(3)
     driver.implicitly_wait(45)
     return False
@@ -404,17 +447,18 @@ def runAutomation(email, password, status, every, hours):
         time.sleep(5)  # let any login redirect settle
 
         if not isLoggedIn():
-            if headless:
-                driver.save_screenshot("login_state.png")
-                log("[login] Not signed in and headless=True — can't do OTP in the "
-                    "background. Set headless=False at the top, run once to "
-                    "sign in by hand, then switch back to headless=True.")
-                # Exit 2 so the scheduler backs off 15 min instead of
-                # relaunching a fresh Chrome every 60 s all window long.
-                raise SessionExpired("not signed in and headless — needs an "
-                                     "interactive sign-in")
+            # A Mac-made session never survives into the container: Chrome
+            # encrypts cookies with the OS keystore, so Linux Chrome can't
+            # read them. Auto-login (tile/email + password + auto-KMSI) works
+            # headless too when the org asks no MFA — so always try it. If
+            # MFA does block us, exit 2 so the scheduler backs off 15 min;
+            # login_state.png shows where it stopped.
             tryAutoLogin(email, password)
             if not waitUntilLoggedIn(300):
+                if headless:
+                    log("[login] Auto-login didn't complete (MFA required?) — "
+                        "see login_state.png for where it stopped.")
+                    raise SessionExpired("headless auto-login did not complete")
                 log("[login] Timed out waiting for sign-in. Exiting.")
                 return
 
