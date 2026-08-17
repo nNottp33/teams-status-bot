@@ -6,6 +6,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import ElementClickInterceptedException
 from datetime import datetime
 import os
 import shutil
@@ -170,9 +171,15 @@ def waitAndClick(css, timeout=15):
     # Implicit wait + WebDriverWait stacks delays (each poll can wait 45s).
     driver.implicitly_wait(0)
     try:
-        WebDriverWait(driver, timeout).until(
+        el = WebDriverWait(driver, timeout).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, css))
-        ).click()
+        )
+        try:
+            el.click()
+        except ElementClickInterceptedException:
+            # Teams' pre-core title bar overlay sits on top of the avatar for
+            # a while after boot — dispatch the click straight to the element.
+            driver.execute_script("arguments[0].click()", el)
     finally:
         driver.implicitly_wait(45)
 
